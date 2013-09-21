@@ -16,7 +16,10 @@
 
 package com.clearspring.analytics.stream;
 
-import static org.junit.Assert.*;
+import cern.jet.random.Distributions;
+import cern.jet.random.engine.MersenneTwister64;
+import cern.jet.random.engine.RandomEngine;
+import org.junit.Test;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -25,13 +28,9 @@ import java.io.ObjectInput;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutput;
 import java.io.ObjectOutputStream;
-import java.util.Arrays;
 import java.util.List;
 
-import org.junit.Test;
-
-import cern.jet.random.Distributions;
-import cern.jet.random.engine.RandomEngine;
+import static org.junit.Assert.assertEquals;
 
 
 public class TestStreamSummary
@@ -39,58 +38,42 @@ public class TestStreamSummary
     private static final int NUM_ITERATIONS = 100000;
 
     @Test
-    public void testStreamSummary()
+    public void testBasic()
     {
-        StreamSummary<String> vs = new StreamSummary<String>(3);
-        String[] stream = {"X", "X", "Y", "Z", "A", "B", "C", "X", "X", "A", "A", "A"};
-        for (String i : stream)
-        {
-            vs.offer(i);
-            /*
-        for(String s : vs.poll(3))
-        System.out.print(s+" ");
-             */
-            System.out.println(vs);
-        }
-    }
-
-    @Test
-    public void testTopK()
-    {
-        StreamSummary<String> vs = new StreamSummary<String>(3);
+        StreamSummary<String> vs = new StreamSummary<String>(5);
+        vs.setDebugMode(true);
         String[] stream = {"X", "X", "Y", "Z", "A", "B", "C", "X", "X", "A", "C", "A", "A"};
         for (String i : stream)
         {
             vs.offer(i);
+            System.out.println(i + " => " + vs);
         }
-        List<Counter<String>> topK = vs.topK(3);
-        for (Counter<String> c : topK)
-        {
-            assertTrue(Arrays.asList("A", "C", "X").contains(c.getItem()));
-        }
+        System.out.println(vs);
+        assertEquals("[X, A, C]", vs.peek(3).toString());
+        assertEquals("[X, A, C]", vs.peek(3).toString());
     }
 
     @Test
-    public void testTopKWithIncrement()
+    public void testBasicWithIncrement()
     {
-        StreamSummary<String> vs = new StreamSummary<String>(3);
+        StreamSummary<String> vs = new StreamSummary<String>(5);
+        vs.setDebugMode(true);
         String[] stream = {"X", "X", "Y", "Z", "A", "B", "C", "X", "X", "A", "C", "A", "A"};
         for (String i : stream)
         {
             vs.offer(i, 10);
         }
-        List<Counter<String>> topK = vs.topK(3);
-        for (Counter<String> c : topK)
-        {
-            assertTrue(Arrays.asList("A", "C", "X").contains(c.getItem()));
-        }
+        System.out.println(vs);
+        assertEquals("[X, A, C]", vs.peek(3).toString());
+        assertEquals("[X, A, C]", vs.peek(3).toString());
     }
 
     @Test
     public void testGeometricDistribution()
     {
         StreamSummary<Integer> vs = new StreamSummary<Integer>(10);
-        RandomEngine re = RandomEngine.makeDefault();
+        vs.setDebugMode(true);
+        RandomEngine re = new MersenneTwister64(923713931);
 
         for (int i = 0; i < NUM_ITERATIONS; i++)
         {
@@ -109,6 +92,7 @@ public class TestStreamSummary
         assertEquals(0, tippyTop);
         System.out.println(vs);
     }
+
 
     @SuppressWarnings("unchecked")
     @Test
@@ -136,12 +120,12 @@ public class TestStreamSummary
         }
     }
 
-
     @SuppressWarnings("unchecked")
     @Test
     public void testSerialization() throws IOException, ClassNotFoundException
     {
-        StreamSummary<String> vs = new StreamSummary<String>(3);
+        StreamSummary<String> vs = new StreamSummary<String>(5);
+        vs.setDebugMode(true);
         String[] stream = {"X", "X", "Y", "Z", "A", "B", "C", "X", "X", "A", "C", "A", "A"};
         for (String i : stream)
         {
@@ -163,7 +147,8 @@ public class TestStreamSummary
     @Test
     public void testByteSerialization() throws IOException, ClassNotFoundException
     {
-        StreamSummary<String> vs = new StreamSummary<String>(3);
+        StreamSummary<String> vs = new StreamSummary<String>(5);
+        vs.setDebugMode(true);
         String[] stream = {"X", "X", "Y", "Z", "A", "B", "C", "X", "X", "A", "C", "A", "A"};
         for (String i : stream)
         {
@@ -183,5 +168,49 @@ public class TestStreamSummary
         StreamSummary<String> clone = new StreamSummary<String>(bytes);
 
         assertEquals(vs.toString(), clone.toString());
+    }
+
+    @Test
+    public void testPerformance() {
+        for (int capacity : new int[] {10, 100, 1000, 10000, 100000, 1000000}) {
+            int[] ks = {5, 10, 100, 1000, 10000, 100000};
+            System.out.println("=== Capacity " + capacity);
+            testPerformance(capacity, ks);
+        }
+    }
+
+    private void testPerformance(int capacity, int[] ks) {
+        int iterationChunk = 10000;
+        long minDuration = 3000;
+        StreamSummary<Integer> vs = new StreamSummary<Integer>(capacity);
+        RandomEngine re = new MersenneTwister64(923713931);
+
+        long t = System.currentTimeMillis();
+        int numIterations = 0;
+        while (System.currentTimeMillis() - t < minDuration) {
+            for (int i = 0; i < iterationChunk; ++i) {
+                int z = re.nextInt() % 1000000;
+                vs.offer(z);
+            }
+            numIterations += iterationChunk;
+        }
+        long dt = System.currentTimeMillis() - t;
+        System.out.println("Offer: " + (int)((1000.0 * numIterations)/dt) + " items/sec; unique " + vs.size());
+
+        for (int k : ks) {
+            if (k > capacity) {
+                continue;
+            }
+            t = System.currentTimeMillis();
+            numIterations = 0;
+            while (System.currentTimeMillis() - t < minDuration) {
+                for (int i = 0; i < iterationChunk; ++i) {
+                    vs.peek(k).size();
+                }
+                numIterations += iterationChunk;
+            }
+            dt = System.currentTimeMillis() - t;
+            System.out.println("Top " + k + ": " + (int)((1000.0 * numIterations)/dt) + " calls/sec");
+        }
     }
 }

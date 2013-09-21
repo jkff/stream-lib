@@ -23,7 +23,7 @@ public interface ISampleSet<T>
 {
     long put(T element);
 
-    long put(T element, int incrementCount);
+    long put(T element, long incrementCount);
 
     T removeRandom();
 

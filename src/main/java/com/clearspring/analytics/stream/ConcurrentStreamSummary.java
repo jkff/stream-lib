@@ -60,7 +60,7 @@ public class ConcurrentStreamSummary<T> implements ITopK<T>
 	}
 
 	@Override
-	public boolean offer(final T element, final int incrementCount)
+	public boolean offer(final T element, final long incrementCount)
 	{
 		long val = incrementCount;
 		ScoredItem value = new ScoredItem(element, incrementCount);

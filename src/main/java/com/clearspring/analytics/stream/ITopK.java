@@ -36,7 +36,7 @@ public interface ITopK<T>
      * @param incrementCount - the increment count for the given count
      * @return false if the element was already in the top
      */
-    boolean offer(T element, int incrementCount);
+    boolean offer(T element, long incrementCount);
 
     /**
      * @param k

@@ -21,15 +21,11 @@ import java.io.IOException;
 import java.io.ObjectInput;
 import java.io.ObjectOutput;
 
-import com.clearspring.analytics.util.ListNode2;
-
 public class Counter<T> implements Externalizable
 {
-    protected ListNode2<StreamSummary<T>.Bucket> bucketNode;
-
-    protected T item;
-    protected long count;
-    protected long error;
+    private T item;
+    private long count;
+    private long error;
 
     /**
      * For de-serialization
@@ -38,12 +34,11 @@ public class Counter<T> implements Externalizable
     {
     }
 
-    public Counter(ListNode2<StreamSummary<T>.Bucket> bucket, T item)
+    public Counter(T item, long count, long error)
     {
-        this.bucketNode = bucket;
-        this.count = 0;
-        this.error = 0;
         this.item = item;
+        this.count = count;
+        this.error = error;
     }
 
     public T getItem()

@@ -55,7 +55,7 @@ public class StochasticTopper<T> implements ITopK<T>
         }
     }
 
-    public boolean offer(T item, int incrementCount)
+    public boolean offer(T item, long incrementCount)
     {
         count++;
         boolean taken = false;

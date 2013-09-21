@@ -16,6 +16,12 @@
 
 package com.clearspring.analytics.stream;
 
+import com.clearspring.analytics.util.ExternalizableUtil;
+import com.clearspring.analytics.util.Pair;
+import it.unimi.dsi.fastutil.ints.AbstractIntComparator;
+import it.unimi.dsi.fastutil.ints.IntHeapPriorityQueue;
+import it.unimi.dsi.fastutil.objects.Object2IntOpenHashMap;
+
 import java.io.ByteArrayInputStream;
 import java.io.Externalizable;
 import java.io.IOException;
@@ -23,13 +29,10 @@ import java.io.ObjectInput;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutput;
 import java.util.ArrayList;
-import java.util.HashMap;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.List;
-
-import com.clearspring.analytics.util.DoublyLinkedList;
-import com.clearspring.analytics.util.ExternalizableUtil;
-import com.clearspring.analytics.util.ListNode2;
-import com.clearspring.analytics.util.Pair;
+import java.util.Map;
 
 /**
  * Based on the <i>Space-Saving</i> algorithm and the <i>Stream-Summary</i>
@@ -37,47 +40,61 @@ import com.clearspring.analytics.util.Pair;
  * <i>Efficient Computation of Frequent and Top-k Elements in Data Streams</i>
  * by Metwally, Agrawal, and Abbadi
  *
+ * General idea: store a table (item -> counter) of bounded size;
+ * when an item arrives: if it's in the table, increment counter;
+ * if it's not in the table, replace item with the smallest counter
+ * (but keep the counter value! so that sum of counters is always
+ * equal to number of offered items).
+ *
+ * The implementation differs from the one suggested in the article, because
+ * the article's implementation in Java requires a lot of overhead for objects.
+ * The current implementation relies mostly on primitive arrays.
+ *
  * @param <T> type of data in the stream to be summarized
  */
 public class StreamSummary<T> implements ITopK<T>, Externalizable
 {
-    protected class Bucket
-    {
-        protected DoublyLinkedList<Counter<T>> counterList;
+    private int[] maxHeap; // contents are indices into 'counts' or 'items'
+    private int[] indexInMaxHeap;
+    private int[] minHeap;
+    private int[] indexInMinHeap;
+    private long[] counts;
+    private long[] errors;
 
-        private long count;
+    // TODO: For the case when T=Long, we could use a primitive array
+    // and a primitive map here. However it makes the code messy :(
+    private T[] items;
+    private Map<T, Integer> indices;
 
-        public Bucket(long count)
-        {
-            this.count = count;
-            this.counterList = new DoublyLinkedList<Counter<T>>();
-        }
-    }
-
-    protected int capacity;
-    private HashMap<T, ListNode2<Counter<T>>> counterMap;
-    protected DoublyLinkedList<Bucket> bucketList;
+    private boolean debugMode;
 
     /**
      * @param capacity maximum size (larger capacities improve accuracy)
      */
     public StreamSummary(int capacity)
     {
-        this.capacity = capacity;
-        counterMap = new HashMap<T, ListNode2<Counter<T>>>();
-        bucketList = new DoublyLinkedList<Bucket>();
+        this.maxHeap = new int[capacity];
+        this.indexInMaxHeap = new int[capacity];
+        this.minHeap = new int[capacity];
+        this.indexInMinHeap = new int[capacity];
+        this.items = (T[])new Object[capacity];
+        this.indices = new Object2IntOpenHashMap<T>(capacity);
+        this.counts = new long[capacity];
+        this.errors = new long[capacity];
     }
 
     public int getCapacity()
     {
-        return capacity;
+        return items.length;
+    }
+
+    public int size()
+    {
+        return indices.size();
     }
 
     /**
-     * Algorithm: <i>Space-Saving</i>
-     *
-     * @param item stream element (<i>e</i>)
-     * @return false if item was already in the stream summary, true otherwise
+     * @return false if item was already in the stream summary, true otherwise.
      */
     @Override
     public boolean offer(T item)
@@ -86,211 +103,222 @@ public class StreamSummary<T> implements ITopK<T>, Externalizable
     }
 
     /**
-     * Algorithm: <i>Space-Saving</i>
-     *
-     * @param item stream element (<i>e</i>)
      * @return false if item was already in the stream summary, true otherwise
      */
     @Override
-    public boolean offer(T item, int incrementCount)
+    public boolean offer(T item, long incrementCount)
     {
         return offerReturnAll(item, incrementCount).left;
     }
 
     /**
-     * @param item stream element (<i>e</i>)
      * @return item dropped from summary if an item was dropped, null otherwise
      */
-    public T offerReturnDropped(T item, int incrementCount)
+    public T offerReturnDropped(T item, long incrementCount)
     {
         return offerReturnAll(item, incrementCount).right;
     }
 
     /**
-     * @param item stream element (<i>e</i>)
-     * @return Pair<isNewItem, itemDropped> where isNewItem is the return value of offer() and itemDropped is null if no item was dropped
+     * @return Pair(isNewItem, itemDropped) where isNewItem is the return value of offer()
+     * and itemDropped is null if no item was dropped
      */
-    public Pair<Boolean, T> offerReturnAll(T item, int incrementCount)
+    public Pair<Boolean, T> offerReturnAll(T item, long incrementCount)
     {
-        ListNode2<Counter<T>> counterNode = counterMap.get(item);
-        boolean isNewItem = (counterNode == null);
-        T droppedItem = null;
-        if (isNewItem)
-        {
-
-            if (size() < capacity)
-            {
-                counterNode = bucketList.enqueue(new Bucket(0)).getValue().counterList.add(new Counter<T>(bucketList.tail(), item));
+        boolean isNew;
+        T evicted = null;
+        isNew = !indices.containsKey(item);
+        int ti = isNew ? -1 : indices.get(item);
+        if (ti == -1) {
+            if (indices.size() == getCapacity()) {
+                // Evict existing item
+                ti = minHeap[0];
+                evicted = items[ti];
+                errors[ti] = counts[ti];
+                indices.remove(evicted);
+            } else {
+                // Add new item
+                ti = indices.size();
+                minHeap[ti] = indexInMinHeap[ti] = ti;
+                maxHeap[ti] = indexInMaxHeap[ti] = ti;
+                siftUp(maxHeap, indexInMaxHeap, ti, true);
+                siftUp(minHeap, indexInMinHeap, ti, false);
             }
-            else
-            {
-                Bucket min = bucketList.first();
-                counterNode = min.counterList.tail();
-                Counter<T> counter = counterNode.getValue();
-                droppedItem = counter.item;
-                counterMap.remove(droppedItem);
-                counter.item = item;
-                counter.error = min.count;
-            }
-            counterMap.put(item, counterNode);
+            indices.put(item, ti);
+            items[ti] = item;
         }
-
-        incrementCounter(counterNode, incrementCount);
-
-        return new Pair<Boolean, T>(isNewItem, droppedItem);
+        counts[ti] += incrementCount;
+        siftUp(maxHeap, indexInMaxHeap, ti, true);
+        siftDown(minHeap, indexInMinHeap, ti, false);
+        if (debugMode) {
+            verifyInvariants();
+        }
+        return Pair.create(isNew, evicted);
     }
 
-    protected void incrementCounter(ListNode2<Counter<T>> counterNode, int incrementCount)
-    {
-        Counter<T> counter = counterNode.getValue();       // count_i
-        ListNode2<Bucket> bucketNode = counter.bucketNode;
-        Bucket bucket = bucketNode.getValue();         // Let Bucket_i be the bucket of count_i
-        ListNode2<Bucket> bucketNodeNext = bucketNode.getNext();
-        Bucket bucketNext = bucketNodeNext == null ? null : bucketNodeNext.getValue(); // Let Bucket_i^+ be Bucket_i's neighbor of larger value
-        bucket.counterList.remove(counterNode);            // Detach count_i from Bucket_i's child-list
-        counter.count = counter.count + incrementCount;
-
-        // Finding the right bucket for count_i
-        if (bucketNext != null && counter.count == bucketNext.count)
-        {
-            bucketNext.counterList.add(counterNode);       // Attach count_i to Bucket_i^+'s child-list
+    private void siftUp(int[] heap, int[] indexInHeap, int x, boolean maxNotMin) {
+        int hi = indexInHeap[x];
+        while(true) {
+            if (hi == 0) break;
+            int parent = (hi-1)/2;
+            long cur = counts[heap[hi]], atParent = counts[heap[parent]];
+            boolean misplaced = (maxNotMin ? (cur > atParent) : (cur < atParent));
+            if (!misplaced) break;
+            swap(heap, indexInHeap, hi, parent);
+            hi = parent;
         }
-        else // A new bucket has to be created
-        {
-            bucketNext = new Bucket(counter.count);        // Create a new Bucket Bucket_new
-            // Assign Bucket_new the value of count_i
-            bucketNext.counterList.add(counterNode);       // Attach count_i to Bucket_new's child-list
-            bucketNodeNext = bucketList.addAfter(bucketNode, bucketNext);  // Insert Bucket_new after Bucket_i
-        }
+    }
 
-        counter.bucketNode = bucketNodeNext;
+    private void swap(int[] heap, int[] indexInHeap, int hi, int hj) {
+        int tmp = heap[hi];
+        heap[hi] = heap[hj];
+        heap[hj] = tmp;
+        indexInHeap[heap[hi]] = hi;
+        indexInHeap[heap[hj]] = hj;
+    }
 
-        //Cleaning up
-        if (bucket.counterList.isEmpty())           // If Bucket_i's child-list is empty
-        {
-            bucketList.remove(bucketNode);         // Detach Bucket_i from the Stream-Summary
+    private void siftDown(int[] heap, int[] indexInHeap, int x, boolean maxNotMin) {
+        int n = indices.size();
+        int hi = indexInHeap[x];
+        long negInfinity = maxNotMin ? Long.MIN_VALUE : Long.MAX_VALUE;
+        while (2 * hi + 1 < n) {
+            long current = counts[heap[hi]];
+            int left = 2 * hi + 1, right = 2 * hi + 2;
+            long atLeft = (left < n) ? counts[heap[left]] : negInfinity;
+            long atRight = (right < n) ? counts[heap[right]] : negInfinity;
+            if (current <= atLeft && current <= atRight) {
+                break;
+            }
+            if (atLeft < atRight) {
+                swap(heap, indexInHeap, hi, left);
+                hi = left;
+            } else {
+                swap(heap, indexInHeap, hi, right);
+                hi = right;
+            }
         }
     }
 
     @Override
     public List<T> peek(int k)
     {
-        List<T> topK = new ArrayList<T>(k);
-
-        for (ListNode2<Bucket> bNode = bucketList.head(); bNode != null; bNode = bNode.getPrev())
-        {
-            Bucket b = bNode.getValue();
-            for (Counter<T> c : b.counterList)
-            {
-                if (topK.size() == k)
-                {
-                    return topK;
-                }
-                topK.add(c.item);
-            }
+        List<T> res = new ArrayList<T>();
+        for (int i : topKIndices(k)) {
+            res.add(items[i]);
         }
-
-        return topK;
+        return res;
     }
 
-    public List<Counter<T>> topK(int k)
-    {
-        List<Counter<T>> topK = new ArrayList<Counter<T>>(k);
-
-        for (ListNode2<Bucket> bNode = bucketList.head(); bNode != null; bNode = bNode.getPrev())
-        {
-            Bucket b = bNode.getValue();
-            for (Counter<T> c : b.counterList)
-            {
-                if (topK.size() == k)
-                {
-                    return topK;
-                }
-                topK.add(c);
-            }
+    public List<Counter<T>> topK(int k) {
+        List<Counter<T>> res = new ArrayList<Counter<T>>();
+        for (int i : topKIndices(k)) {
+            res.add(new Counter<T>(items[i], counts[i], errors[i]));
         }
-
-        return topK;
+        return res;
     }
 
-    /**
-     * @return number of items stored
-     */
-    public int size()
-    {
-        return counterMap.size();
+    private int[] topKIndices(int k) {
+        int n = indices.size();
+        if (k > n) k = n;
+        int[] res = new int[k];
+        int count = 0;
+        IntHeapPriorityQueue q = new IntHeapPriorityQueue(new AbstractIntComparator()
+        {
+            @Override
+            public int compare(int i1, int i2)
+            {
+                long c1 = counts[maxHeap[i1]];
+                long c2 = counts[maxHeap[i2]];
+                if (c1 > c2) return -1;
+                if (c1 < c2) return 1;
+                return 0;
+            }
+        });
+        q.enqueue(0);
+        while (count < k) {
+            int hi = q.dequeue();
+            res[count++] = maxHeap[hi];
+            if (2 * hi + 1 < n) {
+                q.enqueue(2 * hi + 1);
+            }
+            if (2 * hi + 2 < n) {
+                q.enqueue(2 * hi + 2);
+            }
+        }
+        return res;
     }
 
     @Override
     public String toString()
     {
+        List<Pair<T, Long>> pairs = new ArrayList<Pair<T, Long>>();
+        for (T item : indices.keySet()) {
+            pairs.add(Pair.create(item, counts[indices.get(item)]));
+        }
+        Collections.sort(pairs, new Comparator<Pair<T, Long>>()
+        {
+            @Override
+            public int compare(Pair<T, Long> o1, Pair<T, Long> o2)
+            {
+                int res = Long.compare(o1.right, o2.right);
+                if (res != 0) {
+                    return res;
+                }
+                return o1.left.toString().compareTo(o2.right.toString());
+            }
+        });
         StringBuilder sb = new StringBuilder();
-        sb.append('[');
-        for (ListNode2<Bucket> bNode = bucketList.head(); bNode != null; bNode = bNode.getPrev())
-        {
-            Bucket b = bNode.getValue();
-            sb.append('{');
-            sb.append(b.count);
-            sb.append(":[");
-            for (Counter<T> c : b.counterList)
-            {
-                sb.append('{');
-                sb.append(c.item);
-                sb.append(':');
-                sb.append(c.error);
-                sb.append("},");
+        sb.append("{");
+        for (Pair<T, Long> item : pairs) {
+            if (sb.length() > 1) {
+                sb.append(", ");
             }
-            if (b.counterList.size() > 0)
-            {
-                sb.deleteCharAt(sb.length() - 1);
-            }
-            sb.append("]},");
+            sb.append(item.left).append(": ").append(item.right);
         }
-        if (bucketList.size() > 0)
-        {
-            sb.deleteCharAt(sb.length() - 1);
-        }
-        sb.append(']');
+        sb.append("}");
         return sb.toString();
+    }
+
+    private void verifyInvariants() {
+        int n = indices.size();
+        for (int i = 0; i < n; ++i) {
+            assert indices.get(items[i]) == i;
+            assert minHeap[indexInMinHeap[i]] == i;
+            assert maxHeap[indexInMaxHeap[i]] == i;
+            int hi = indexInMinHeap[i];
+            assert counts[minHeap[hi]] >= counts[minHeap[(hi-1)/2]];
+            assert counts[maxHeap[hi]] <= counts[maxHeap[(hi-1)/2]];
+        }
     }
 
     @SuppressWarnings("unchecked")
     @Override
     public void readExternal(ObjectInput in) throws IOException, ClassNotFoundException
     {
-        this.bucketList = new DoublyLinkedList<Bucket>();
-        this.capacity = in.readInt();
-
+        int capacity = in.readInt();
         int size = in.readInt();
-        this.counterMap = new HashMap<T, ListNode2<Counter<T>>>(size);
-
-        Bucket currentBucket = null;
-        ListNode2<Bucket> currentBucketNode = null;
-        for (int i = 0; i < size; i++)
-        {
-            Counter<T> c = (Counter<T>) in.readObject();
-            if (currentBucket == null || c.count != currentBucket.count)
-            {
-                currentBucket = new Bucket(c.count);
-                currentBucketNode = bucketList.add(currentBucket);
-            }
-            c.bucketNode = currentBucketNode;
-            counterMap.put(c.item, currentBucket.counterList.add(c));
+        this.maxHeap = new int[capacity];
+        this.indexInMaxHeap = new int[capacity];
+        this.minHeap = new int[capacity];
+        this.indexInMinHeap = new int[capacity];
+        this.items = (T[])new Object[capacity];
+        this.indices = new Object2IntOpenHashMap<T>(capacity);
+        this.counts = new long[capacity];
+        for (int i = 0; i < size; ++i) {
+            T item = (T)in.readObject();
+            long count = in.readLong();
+            offer(item, count);
         }
     }
 
     @Override
     public void writeExternal(ObjectOutput out) throws IOException
     {
-        out.writeInt(this.capacity);
-        out.writeInt(this.size());
-        for (ListNode2<Bucket> bNode = bucketList.tail(); bNode != null; bNode = bNode.getNext())
-        {
-            Bucket b = bNode.getValue();
-            for (Counter<T> c : b.counterList)
-            {
-                out.writeObject(c);
-            }
+        out.writeInt(counts.length);
+        out.writeInt(indices.size());
+        for (int i = 0; i < indices.size(); ++i) {
+            out.writeObject(items[i]);
+            out.writeLong(counts[i]);
         }
     }
 
@@ -303,10 +331,6 @@ public class StreamSummary<T> implements ITopK<T>, Externalizable
 
     /**
      * For de-serialization
-     *
-     * @param bytes
-     * @throws IOException
-     * @throws ClassNotFoundException
      */
     public StreamSummary(byte[] bytes) throws IOException, ClassNotFoundException
     {
@@ -321,5 +345,9 @@ public class StreamSummary<T> implements ITopK<T>, Externalizable
     public byte[] toBytes() throws IOException
     {
         return ExternalizableUtil.toBytes(this);
+    }
+
+    public void setDebugMode(boolean debugMode) {
+        this.debugMode = debugMode;
     }
 }
