@@ -19,7 +19,9 @@ package com.clearspring.analytics.stream;
 import com.clearspring.analytics.util.ExternalizableUtil;
 import com.clearspring.analytics.util.Pair;
 import it.unimi.dsi.fastutil.ints.AbstractIntComparator;
+import it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap;
 import it.unimi.dsi.fastutil.ints.IntHeapPriorityQueue;
+import it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap;
 import it.unimi.dsi.fastutil.objects.Object2IntOpenHashMap;
 
 import java.io.ByteArrayInputStream;
@@ -54,6 +56,11 @@ import java.util.Map;
  */
 public class StreamSummary<T> implements ITopK<T>, Externalizable
 {
+    enum TypeTag {
+        OBJECT,
+        INT,
+        LONG
+    }
     private int[] maxHeap; // contents are indices into 'counts' or 'items'
     private int[] indexInMaxHeap;
     private int[] minHeap;
@@ -63,6 +70,7 @@ public class StreamSummary<T> implements ITopK<T>, Externalizable
 
     // TODO: For the case when T=Long, we could use a primitive array
     // and a primitive map here. However it makes the code messy :(
+    private TypeTag typeTag;
     private T[] items;
     private Map<T, Integer> indices;
 
@@ -77,10 +85,9 @@ public class StreamSummary<T> implements ITopK<T>, Externalizable
         this.indexInMaxHeap = new int[capacity];
         this.minHeap = new int[capacity];
         this.indexInMinHeap = new int[capacity];
-        this.items = (T[])new Object[capacity];
-        this.indices = new Object2IntOpenHashMap<T>(capacity);
         this.counts = new long[capacity];
         this.errors = new long[capacity];
+        this.items = (T[])new Object[capacity];
     }
 
     public int getCapacity()
@@ -91,6 +98,22 @@ public class StreamSummary<T> implements ITopK<T>, Externalizable
     public int size()
     {
         return indices.size();
+    }
+
+    private void summonIndices(T item) {
+        if (indices != null) {
+            return;
+        }
+        if (item instanceof Integer) {
+            typeTag = TypeTag.INT;
+            indices = (Map<T, Integer>)new Int2IntOpenHashMap(getCapacity(), 0.75f);
+        } else if (item instanceof Long) {
+            typeTag = TypeTag.LONG;
+            indices = (Map<T, Integer>)new Long2IntOpenHashMap(getCapacity(), 0.75f);
+        } else {
+            typeTag = TypeTag.OBJECT;
+            indices = (Map<T, Integer>)new Object2IntOpenHashMap(getCapacity(), 0.75f);
+        }
     }
 
     /**
@@ -125,10 +148,12 @@ public class StreamSummary<T> implements ITopK<T>, Externalizable
      */
     public Pair<Boolean, T> offerReturnAll(T item, long incrementCount)
     {
+        summonIndices(item);
         boolean isNew;
         T evicted = null;
-        isNew = !indices.containsKey(item);
-        int ti = isNew ? -1 : indices.get(item);
+        Integer ti_ = indices.get(item);
+        isNew = (ti_ == null);
+        int ti = isNew ? -1 : ti_;
         if (ti == -1) {
             if (indices.size() == getCapacity()) {
                 // Evict existing item
@@ -202,6 +227,9 @@ public class StreamSummary<T> implements ITopK<T>, Externalizable
     @Override
     public List<T> peek(int k)
     {
+        if (indices == null) {
+            return Collections.emptyList();
+        }
         List<T> res = new ArrayList<T>();
         for (int i : topKIndices(k)) {
             res.add(items[i]);
@@ -210,6 +238,9 @@ public class StreamSummary<T> implements ITopK<T>, Externalizable
     }
 
     public List<Counter<T>> topK(int k) {
+        if (indices == null) {
+            return Collections.emptyList();
+        }
         List<Counter<T>> res = new ArrayList<Counter<T>>();
         for (int i : topKIndices(k)) {
             res.add(new Counter<T>(items[i], counts[i], errors[i]));
@@ -251,6 +282,9 @@ public class StreamSummary<T> implements ITopK<T>, Externalizable
     @Override
     public String toString()
     {
+        if (indices == null) {
+            return "{}";
+        }
         List<Pair<T, Long>> pairs = new ArrayList<Pair<T, Long>>();
         for (T item : indices.keySet()) {
             pairs.add(Pair.create(item, counts[indices.get(item)]));
@@ -295,6 +329,7 @@ public class StreamSummary<T> implements ITopK<T>, Externalizable
     @Override
     public void readExternal(ObjectInput in) throws IOException, ClassNotFoundException
     {
+        this.typeTag = (TypeTag)in.readObject();
         int capacity = in.readInt();
         int size = in.readInt();
         this.maxHeap = new int[capacity];
@@ -302,10 +337,23 @@ public class StreamSummary<T> implements ITopK<T>, Externalizable
         this.minHeap = new int[capacity];
         this.indexInMinHeap = new int[capacity];
         this.items = (T[])new Object[capacity];
-        this.indices = new Object2IntOpenHashMap<T>(capacity);
         this.counts = new long[capacity];
         for (int i = 0; i < size; ++i) {
-            T item = (T)in.readObject();
+            T item;
+            switch(typeTag) {
+            case OBJECT:
+                item = (T)in.readObject();
+                break;
+            case INT:
+                item = (T)Integer.valueOf(in.readInt());
+                break;
+            case LONG:
+                item = (T)Long.valueOf(in.readLong());
+                break;
+            default:
+                throw new IllegalStateException("typeTag == 0 but non-empty");
+            }
+            summonIndices(item);
             long count = in.readLong();
             offer(item, count);
         }
@@ -314,10 +362,27 @@ public class StreamSummary<T> implements ITopK<T>, Externalizable
     @Override
     public void writeExternal(ObjectOutput out) throws IOException
     {
+        out.writeObject(typeTag);
         out.writeInt(counts.length);
+        if (indices == null) {
+            out.writeInt(0);
+            return;
+        }
         out.writeInt(indices.size());
         for (int i = 0; i < indices.size(); ++i) {
-            out.writeObject(items[i]);
+            switch(typeTag) {
+            case OBJECT:
+                out.writeObject(items[i]);
+                break;
+            case INT:
+                out.writeInt((Integer)items[i]);
+                break;
+            case LONG:
+                out.writeLong((Long)items[i]);
+                break;
+            default:
+                throw new IllegalStateException("typeTag == 0 but non-empty");
+            }
             out.writeLong(counts[i]);
         }
     }
