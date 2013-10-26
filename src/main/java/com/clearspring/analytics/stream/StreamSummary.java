@@ -18,6 +18,7 @@ package com.clearspring.analytics.stream;
 
 import com.clearspring.analytics.util.ExternalizableUtil;
 import com.clearspring.analytics.util.Pair;
+import com.clearspring.analytics.util.vla.VarintCounterArray;
 import it.unimi.dsi.fastutil.ints.AbstractIntComparator;
 import it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap;
 import it.unimi.dsi.fastutil.ints.IntHeapPriorityQueue;
@@ -65,8 +66,8 @@ public class StreamSummary<T> implements ITopK<T>, Externalizable
     private int[] indexInMaxHeap;
     private int[] minHeap;
     private int[] indexInMinHeap;
-    private long[] counts;
-    private long[] errors;
+    private VarintCounterArray counts;
+    private VarintCounterArray errors;
 
     // TODO: For the case when T=Long, we could use a primitive array
     // and a primitive map here. However it makes the code messy :(
@@ -85,8 +86,8 @@ public class StreamSummary<T> implements ITopK<T>, Externalizable
         this.indexInMaxHeap = new int[capacity];
         this.minHeap = new int[capacity];
         this.indexInMinHeap = new int[capacity];
-        this.counts = new long[capacity];
-        this.errors = new long[capacity];
+        this.counts = new VarintCounterArray(capacity);
+        this.errors = new VarintCounterArray(capacity);
         this.items = (T[])new Object[capacity];
     }
 
@@ -159,7 +160,7 @@ public class StreamSummary<T> implements ITopK<T>, Externalizable
                 // Evict existing item
                 ti = minHeap[0];
                 evicted = items[ti];
-                errors[ti] = counts[ti];
+                errors.set(ti, counts.get(ti));
                 indices.remove(evicted);
             } else {
                 // Add new item
@@ -172,7 +173,7 @@ public class StreamSummary<T> implements ITopK<T>, Externalizable
             indices.put(item, ti);
             items[ti] = item;
         }
-        counts[ti] += incrementCount;
+        counts.addTo(ti, incrementCount);
         siftUp(maxHeap, indexInMaxHeap, ti, true);
         siftDown(minHeap, indexInMinHeap, ti, false);
         if (debugMode) {
@@ -186,7 +187,7 @@ public class StreamSummary<T> implements ITopK<T>, Externalizable
         while(true) {
             if (hi == 0) break;
             int parent = (hi-1)/2;
-            long cur = counts[heap[hi]], atParent = counts[heap[parent]];
+            long cur = counts.get(heap[hi]), atParent = counts.get(heap[parent]);
             boolean misplaced = (maxNotMin ? (cur > atParent) : (cur < atParent));
             if (!misplaced) break;
             swap(heap, indexInHeap, hi, parent);
@@ -207,10 +208,10 @@ public class StreamSummary<T> implements ITopK<T>, Externalizable
         int hi = indexInHeap[x];
         long negInfinity = maxNotMin ? Long.MIN_VALUE : Long.MAX_VALUE;
         while (2 * hi + 1 < n) {
-            long current = counts[heap[hi]];
+            long current = counts.get(heap[hi]);
             int left = 2 * hi + 1, right = 2 * hi + 2;
-            long atLeft = (left < n) ? counts[heap[left]] : negInfinity;
-            long atRight = (right < n) ? counts[heap[right]] : negInfinity;
+            long atLeft = (left < n) ? counts.get(heap[left]) : negInfinity;
+            long atRight = (right < n) ? counts.get(heap[right]) : negInfinity;
             if (current <= atLeft && current <= atRight) {
                 break;
             }
@@ -243,7 +244,7 @@ public class StreamSummary<T> implements ITopK<T>, Externalizable
         }
         List<Counter<T>> res = new ArrayList<Counter<T>>();
         for (int i : topKIndices(k)) {
-            res.add(new Counter<T>(items[i], counts[i], errors[i]));
+            res.add(new Counter<T>(items[i], counts.get(i), errors.get(i)));
         }
         return res;
     }
@@ -258,8 +259,8 @@ public class StreamSummary<T> implements ITopK<T>, Externalizable
             @Override
             public int compare(int i1, int i2)
             {
-                long c1 = counts[maxHeap[i1]];
-                long c2 = counts[maxHeap[i2]];
+                long c1 = counts.get(maxHeap[i1]);
+                long c2 = counts.get(maxHeap[i2]);
                 if (c1 > c2) return -1;
                 if (c1 < c2) return 1;
                 return 0;
@@ -287,7 +288,7 @@ public class StreamSummary<T> implements ITopK<T>, Externalizable
         }
         List<Pair<T, Long>> pairs = new ArrayList<Pair<T, Long>>();
         for (T item : indices.keySet()) {
-            pairs.add(Pair.create(item, counts[indices.get(item)]));
+            pairs.add(Pair.create(item, counts.get(indices.get(item))));
         }
         Collections.sort(pairs, new Comparator<Pair<T, Long>>()
         {
@@ -320,8 +321,8 @@ public class StreamSummary<T> implements ITopK<T>, Externalizable
             assert minHeap[indexInMinHeap[i]] == i;
             assert maxHeap[indexInMaxHeap[i]] == i;
             int hi = indexInMinHeap[i];
-            assert counts[minHeap[hi]] >= counts[minHeap[(hi-1)/2]];
-            assert counts[maxHeap[hi]] <= counts[maxHeap[(hi-1)/2]];
+            assert counts.get(minHeap[hi]) >= counts.get(minHeap[(hi-1)/2]);
+            assert counts.get(maxHeap[hi]) <= counts.get(maxHeap[(hi-1)/2]);
         }
     }
 
@@ -337,7 +338,7 @@ public class StreamSummary<T> implements ITopK<T>, Externalizable
         this.minHeap = new int[capacity];
         this.indexInMinHeap = new int[capacity];
         this.items = (T[])new Object[capacity];
-        this.counts = new long[capacity];
+        this.counts = new VarintCounterArray(capacity);
         for (int i = 0; i < size; ++i) {
             T item;
             switch(typeTag) {
@@ -363,7 +364,7 @@ public class StreamSummary<T> implements ITopK<T>, Externalizable
     public void writeExternal(ObjectOutput out) throws IOException
     {
         out.writeObject(typeTag);
-        out.writeInt(counts.length);
+        out.writeInt(items.length);
         if (indices == null) {
             out.writeInt(0);
             return;
@@ -383,7 +384,7 @@ public class StreamSummary<T> implements ITopK<T>, Externalizable
             default:
                 throw new IllegalStateException("typeTag == 0 but non-empty");
             }
-            out.writeLong(counts[i]);
+            out.writeLong(counts.get(i));
         }
     }
 
